@@ -18,54 +18,61 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
 from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent / "nla_repo"))
-from nla.datagen.injection_tokens import build_token_meta, compute_critic_suffix_ids
-from nla.schema import wrap_explanation, NLATokenMeta, compute_canonical_neighbors
+from nla.datagen.injection_tokens import compute_critic_suffix_ids
+from nla.schema import wrap_explanation, NLATokenMeta
 
 from load_nla import load_sidecar
 
 # Placeholder stored in parquet; NLADataSource swaps it for the injection char at load time.
 _INJECT_PLACEHOLDER = "<INJECT>"
 
-_INJECTION_RANGE = (0x3200, 0x33FF)
+_AV_REPO = "kitft/nla-qwen2.5-7b-L20-av"
 
 
-def _find_injection_token_in_context(tokenizer, actor_template):
-    """Find a CJK injection char that remains a single token inside the full chat template.
+def _load_pretrained_token_meta(av_checkpoint: str | None, tokenizer, critic_template: str) -> NLATokenMeta:
+    """Read token metadata from the pretrained AV checkpoint sidecar.
 
-    find_injection_token() validates in isolation only. BPE can merge the char with
-    an adjacent '>' (end of '<concept>') in context, making the token invisible to
-    the hook scan. This validates inside apply_chat_template so what we pick is
-    guaranteed to work at injection time.
+    The sidecar records the exact injection_char and neighbor IDs that were used
+    during original training. Using them here guarantees the fine-tuning data and
+    hook configuration match what the model already knows.
+
+    Falls back to downloading just the nla_meta.yaml from HuggingFace if no local
+    checkpoint is provided (only 3KB — does not download the full weights).
     """
-    lo, hi = _INJECTION_RANGE
-    for codepoint in range(lo, hi + 1):
-        char = chr(codepoint)
-        ids_iso = tokenizer(char, add_special_tokens=False)["input_ids"]
-        if len(ids_iso) != 1:
-            continue
-        token_id = ids_iso[0]
-        content = actor_template.format(injection_char=char)
-        full_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": content}],
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        if sum(1 for t in full_ids if t == token_id) == 1:
-            return char, token_id
-    raise RuntimeError(
-        f"No single-token CJK char in U+{lo:04X}–U+{hi:04X} survives in template context "
-        f"for tokenizer {tokenizer.name_or_path!r}. Hand-pick a char and hardcode it."
-    )
+    raw_sidecar = None
 
+    if av_checkpoint is not None:
+        try:
+            raw_sidecar = load_sidecar(av_checkpoint)
+            print(f"  Read token metadata from local sidecar at {av_checkpoint}")
+        except Exception as e:
+            print(f"  WARNING: could not load local sidecar ({e}), falling back to HuggingFace")
 
-def _build_token_meta_safe(tokenizer, actor_template, critic_template):
-    """build_token_meta replacement that validates the injection char in template context."""
-    inj_char, inj_id = _find_injection_token_in_context(tokenizer, actor_template)
-    left_id, right_id = compute_canonical_neighbors(tokenizer, actor_template, inj_char, inj_id)
-    suffix_ids = compute_critic_suffix_ids(tokenizer, critic_template) if critic_template else None
+    if raw_sidecar is None:
+        from huggingface_hub import hf_hub_download
+        print(f"  Downloading nla_meta.yaml from {_AV_REPO} (no full model download)...")
+        yaml_path = hf_hub_download(_AV_REPO, "nla_meta.yaml")
+        with open(yaml_path) as f:
+            raw_sidecar = yaml.safe_load(f)
+        print(f"  Downloaded sidecar from {_AV_REPO}")
+
+    tokens = raw_sidecar["tokens"]
+    inj_char = tokens["injection_char"]
+    inj_id = tokens["injection_token_id"]
+    left_id = tokens["injection_left_neighbor_id"]
+    right_id = tokens["injection_right_neighbor_id"]
+
+    # critic_suffix_ids depend on the critic template text; recompute from the
+    # live tokenizer so they stay correct even if the critic template differs.
+    suffix_ids = compute_critic_suffix_ids(tokenizer, critic_template)
+
+    print(f"  injection_char: {inj_char!r}  token_id: {inj_id}")
+    print(f"  left_neighbor_id: {left_id}  right_neighbor_id: {right_id}")
+
     return NLATokenMeta(
         injection_char=inj_char,
         injection_token_id=inj_id,
@@ -125,10 +132,13 @@ def build_parquets(
     doc_ids = table.column("doc_id").to_pylist()
 
     # ------------------------------------------------------------------ #
-    # 2. Resolve actor/critic templates + token metadata
-    #    Priority: pretrained sidecar > hardcoded defaults from stage3_build.py
+    # 2. Resolve actor/critic templates + token metadata from pretrained sidecar
     # ------------------------------------------------------------------ #
-    actor_template = (
+    critic_template = "Summary of the following text: <text>{explanation}</text> <summary>"
+
+    # Load the actor template from the sidecar (or its default if absent).
+    # The sidecar template has {injection_char} as a Python format placeholder.
+    _default_actor_template = (
         "You are a meticulous AI researcher conducting an important investigation "
         "into activation vectors from a language model. Your overall task is to "
         "describe the semantic content of that activation vector.\n\n"
@@ -140,30 +150,28 @@ def build_parquets(
         "<concept>{injection_char}</concept>\n\n"
         "Please provide an explanation."
     )
-    critic_template = "Summary of the following text: <text>{explanation}</text> <summary>"
 
+    actor_template = _default_actor_template
     if av_checkpoint is not None:
         try:
-            sidecar = load_sidecar(av_checkpoint)
-            templates = sidecar.get("prompt_templates", {})
+            sc = load_sidecar(av_checkpoint)
+            templates = sc.get("prompt_templates", {})
             actor_template = templates.get("actor") or templates.get("av") or actor_template
             critic_template = templates.get("critic") or templates.get("ar") or critic_template
-            print(f"Loaded templates from sidecar at {av_checkpoint}")
         except Exception as e:
-            print(f"WARNING: could not load sidecar ({e}), using default templates")
+            print(f"WARNING: could not read templates from local sidecar ({e})")
 
-    # Derive injection token IDs from the live tokenizer (same function
-    # used by training-side config.py to verify them).
     model_name = "Qwen/Qwen2.5-7B-Instruct"
-    print(f"Loading tokenizer from {model_name} to compute token IDs...")
+    print(f"Loading tokenizer from {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tok_meta = _build_token_meta_safe(tokenizer, actor_template, critic_template)
 
-    print(f"  injection_char:         {tok_meta.injection_char!r}")
-    print(f"  injection_token_id:     {tok_meta.injection_token_id}")
-    print(f"  left_neighbor_id:       {tok_meta.injection_left_neighbor_id}")
-    print(f"  right_neighbor_id:      {tok_meta.injection_right_neighbor_id}")
-    print(f"  critic_suffix_ids:      {tok_meta.critic_suffix_ids}")
+    # Token IDs come from the pretrained sidecar — bypass build_token_meta entirely.
+    # Every char in U+3200-U+33FF gets absorbed into a multi-char tiktoken regex
+    # chunk by the surrounding ><, so re-computing neighbors always fails.  The
+    # pretrained sidecar already has the correct values from its own training run.
+    print("Resolving injection token metadata from pretrained sidecar...")
+    tok_meta = _load_pretrained_token_meta(av_checkpoint, tokenizer, critic_template)
+    print(f"  critic_suffix_ids: {tok_meta.critic_suffix_ids}")
 
     # ------------------------------------------------------------------ #
     # 3. Document-level split
@@ -174,8 +182,13 @@ def build_parquets(
     # ------------------------------------------------------------------ #
     # 4. Build av_sft rows
     # ------------------------------------------------------------------ #
-    # Prompt stores <INJECT> placeholder; NLADataSource replaces it with ㊗ at load time.
-    actor_prompt_content = actor_template.format(injection_char=_INJECT_PLACEHOLDER)
+    # Prompt stores <INJECT> placeholder; finetune_av.py replaces it with the real char.
+    # The sidecar template may store either a {injection_char} format placeholder or the
+    # literal injection char — handle both.
+    if "{injection_char}" in actor_template:
+        actor_prompt_content = actor_template.format(injection_char=_INJECT_PLACEHOLDER)
+    else:
+        actor_prompt_content = actor_template.replace(tok_meta.injection_char, _INJECT_PLACEHOLDER)
     prompt_msg = [{"role": "user", "content": actor_prompt_content}]
 
     av_rows = {"prompt": [], "response": [], "activation_vector": [],
